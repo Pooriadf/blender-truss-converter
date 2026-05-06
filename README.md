@@ -15,6 +15,8 @@ Align vertices before rebuilding structural joints and nodes.
 
 ![Align vertices](align_vertices.png)
 
+Calculate weight and load directly from selected mesh objects.
+
 ## What it does
 
 - Converts solid beam geometry into centerline truss members
@@ -23,6 +25,7 @@ Align vertices before rebuilding structural joints and nodes.
 - Extends and connects loose line ends
 - Rebuilds intersections into connected line segments
 - Runs a sanity check for short edges and floating vertices
+- Calculates weight and load from mesh volume or manual thickness
 - Exports truss lines to DXF
 
 ## Requirements

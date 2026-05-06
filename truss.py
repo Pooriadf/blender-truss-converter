@@ -12,7 +12,7 @@ import bpy
 import bmesh
 import mathutils
 from bpy_extras.io_utils import ExportHelper
-from bpy.props import StringProperty
+from bpy.props import StringProperty, FloatProperty, BoolProperty
 
 # ==============================================================================
 #   OPERATOR 1A: STANDARD CONVERT (STRICT)
@@ -540,7 +540,72 @@ class TRUSS_OT_SanityCheck(bpy.types.Operator):
 
 
 # ==============================================================================
-#   OPERATOR 6: EXPORT TO DXF
+#   OPERATOR 6: WEIGHT CALCULATOR
+# ==============================================================================
+
+class TRUSS_OT_CalculateWeight(bpy.types.Operator):
+    """Calculates object weight from mesh volume or manual area and thickness"""
+    bl_idname = "truss.calculate_weight"
+    bl_label = "Calculate Weight"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        density = context.scene.calc_density
+        thickness_manual = context.scene.calc_thickness
+        is_double_sided = context.scene.calc_double_sided
+        force_override = context.scene.calc_force_override
+
+        selected_objs = [obj for obj in context.selected_objects if obj.type == 'MESH']
+        if not selected_objs:
+            self.report({'WARNING'}, "No mesh objects selected.")
+            return {'CANCELLED'}
+
+        total_volume = 0.0
+        method_report = "Volume (Geometric)"
+        depsgraph = context.evaluated_depsgraph_get()
+
+        for obj in selected_objs:
+            obj_eval = obj.evaluated_get(depsgraph)
+            mesh = obj_eval.to_mesh()
+
+            bm = bmesh.new()
+            bm.from_mesh(mesh)
+            bmesh.ops.transform(bm, matrix=obj.matrix_world, verts=bm.verts)
+
+            use_manual = force_override
+            vol = 0.0
+
+            if not use_manual:
+                vol = bm.calc_volume()
+                if abs(vol) < 0.0001:
+                    use_manual = True
+
+            if use_manual:
+                area = sum(face.calc_area() for face in bm.faces)
+                if is_double_sided:
+                    area = area / 2.0
+                vol = area * thickness_manual
+                method_report = "Manual (Area x Thickness)"
+
+            total_volume += abs(vol)
+            bm.free()
+            obj_eval.to_mesh_clear()
+
+        weight_kg = total_volume * density
+        weight_kn = (weight_kg * 9.81) / 1000.0
+
+        context.scene["last_calc_volume"] = total_volume
+        context.scene["last_calc_weight"] = weight_kg
+        context.scene["last_calc_force"] = weight_kn
+        context.scene["last_calc_method"] = method_report
+        context.scene["last_obj_count"] = len(selected_objs)
+
+        self.report({'INFO'}, f"Calculated weight for {len(selected_objs)} objects.")
+        return {'FINISHED'}
+
+
+# ==============================================================================
+#   OPERATOR 7: EXPORT TO DXF
 # ==============================================================================
 
 class TRUSS_OT_ExportDXF(bpy.types.Operator, ExportHelper):
@@ -610,6 +675,32 @@ class TRUSS_PT_MainPanel(bpy.types.Panel):
     def draw(self, context):
         layout = self.layout
         is_edit = (context.mode == 'EDIT_MESH')
+
+        # --- STEP 0: WEIGHT CALCULATOR ---
+        col = layout.column(align=True)
+        col.label(text="Step 0: Weight Calculator", icon='MOD_SIMPLEDEFORM')
+        col.prop(context.scene, "calc_density", text="Density (kg/m³)")
+        col.prop(context.scene, "calc_force_override", text="Force Manual Thickness")
+
+        if context.scene.calc_force_override:
+            box = col.box()
+            box.label(text="Geometry volume is ignored.", icon='ERROR')
+            box.prop(context.scene, "calc_thickness", text="Manual Thickness (m)")
+            box.prop(context.scene, "calc_double_sided", text="Double Sided Geometry")
+        else:
+            col.label(text="Uses geometric volume when available.", icon='INFO')
+
+        col.operator("truss.calculate_weight", text="Calculate Weight", icon='PHYSICS')
+
+        if context.scene.get("last_calc_weight") is not None:
+            box = col.box()
+            box.label(text=f"Selected Objects: {context.scene.get('last_obj_count', 0)}")
+            box.label(text=f"Total Weight: {context.scene['last_calc_weight']:.2f} kg")
+            row = box.row()
+            row.alert = True
+            row.label(text=f"Load: {context.scene['last_calc_force']:.2f} kN")
+            box.label(text=f"Method: {context.scene.get('last_calc_method', 'Unknown')}")
+        col.separator()
         
         # --- HELPER BUTTON ---
         if not is_edit:
@@ -678,6 +769,7 @@ class TRUSS_PT_MainPanel(bpy.types.Panel):
 # ==============================================================================
 
 classes = (
+    TRUSS_OT_CalculateWeight,
     TRUSS_OT_ConvertLines,
     TRUSS_OT_ConvertAssemblyLines,
     TRUSS_OT_AlignVertices,
@@ -691,8 +783,16 @@ classes = (
 def register():
     for cls in classes:
         bpy.utils.register_class(cls)
+    bpy.types.Scene.calc_density = FloatProperty(name="Density", default=2700.0)
+    bpy.types.Scene.calc_thickness = FloatProperty(name="Thickness", default=0.03)
+    bpy.types.Scene.calc_double_sided = BoolProperty(name="Double Sided", default=True)
+    bpy.types.Scene.calc_force_override = BoolProperty(name="Force Override", default=False)
 
 def unregister():
+    del bpy.types.Scene.calc_density
+    del bpy.types.Scene.calc_thickness
+    del bpy.types.Scene.calc_double_sided
+    del bpy.types.Scene.calc_force_override
     for cls in classes:
         bpy.utils.unregister_class(cls)
 
