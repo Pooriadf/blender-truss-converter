@@ -25,7 +25,7 @@ Calculate weight and load directly from selected mesh objects.
 - Extends and connects loose line ends
 - Rebuilds intersections into connected line segments
 - Runs a sanity check for short edges and floating vertices
-- Calculates weight and load from mesh volume or manual thickness
+- Calculates weight and load from mesh volume or manual thickness (for deadloads)
 - Exports truss lines to DXF
 
 ## Requirements

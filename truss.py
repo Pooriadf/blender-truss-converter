@@ -262,10 +262,55 @@ class TRUSS_OT_AlignVertices(bpy.types.Operator):
         
         sel_verts = [v for v in bm.verts if v.select]
 
+        tol = getattr(context.scene, "align_tolerance", 0.005)
+
+        # If all verts are selected, cluster by axis within tolerance
+        all_selected = (len(sel_verts) == len(bm.verts))
+
         if len(sel_verts) < 2:
             self.report({'WARNING'}, "Select at least 2 vertices to align.")
             return {'CANCELLED'}
 
+        # Group-and-align when user selected all verts: cluster verts whose
+        # coordinate(s) are within the tolerance and align each cluster separately.
+        if all_selected:
+            groups = []
+            for v in bm.verts:
+                placed = False
+                for g in groups:
+                    rep = g[0]
+                    ok = True
+                    if 'X' in self.axis and abs(v.co.x - rep.co.x) > tol: ok = False
+                    if 'Y' in self.axis and abs(v.co.y - rep.co.y) > tol: ok = False
+                    if 'Z' in self.axis and abs(v.co.z - rep.co.z) > tol: ok = False
+                    if ok:
+                        g.append(v)
+                        placed = True
+                        break
+                if not placed:
+                    groups.append([v])
+
+            moved = 0
+            for g in groups:
+                if len(g) < 2: continue
+                if 'X' in self.axis:
+                    avg_x = sum(v.co.x for v in g) / len(g)
+                if 'Y' in self.axis:
+                    avg_y = sum(v.co.y for v in g) / len(g)
+                if 'Z' in self.axis:
+                    avg_z = sum(v.co.z for v in g) / len(g)
+
+                for v in g:
+                    if 'X' in self.axis: v.co.x = avg_x
+                    if 'Y' in self.axis: v.co.y = avg_y
+                    if 'Z' in self.axis: v.co.z = avg_z
+                    moved += 1
+
+            bmesh.update_edit_mesh(obj.data)
+            self.report({'INFO'}, f"Aligned {moved} vertices in {len([g for g in groups if len(g)>1])} clusters using tolerance {tol}.")
+            return {'FINISHED'}
+
+        # Otherwise fall back to original behaviour but use the tolerance
         avg_x = sum(v.co.x for v in sel_verts) / len(sel_verts)
         avg_y = sum(v.co.y for v in sel_verts) / len(sel_verts)
         avg_z = sum(v.co.z for v in sel_verts) / len(sel_verts)
@@ -274,7 +319,7 @@ class TRUSS_OT_AlignVertices(bpy.types.Operator):
         for v in bm.verts:
             if not v.select:
                 for sv in sel_verts:
-                    if (v.co - sv.co).length < 0.005: 
+                    if (v.co - sv.co).length < tol:
                         verts_to_move.add(v)
                         break
 
@@ -284,7 +329,7 @@ class TRUSS_OT_AlignVertices(bpy.types.Operator):
             if 'Z' in self.axis: v.co.z = avg_z
 
         bmesh.update_edit_mesh(obj.data)
-        self.report({'INFO'}, f"Aligned {len(verts_to_move)} grouped vertices on {self.axis} axis.")
+        self.report({'INFO'}, f"Aligned {len(verts_to_move)} grouped vertices on {self.axis} axis (tol={tol}).")
         return {'FINISHED'}
 
 
@@ -720,6 +765,7 @@ class TRUSS_PT_MainPanel(bpy.types.Panel):
         
         align_col = col.column(align=True)
         align_col.active = is_edit
+        align_col.prop(context.scene, "align_tolerance", text="Tolerance (m)")
         
         row = align_col.row(align=True)
         row.operator("truss.align_vertices", text="Align X").axis = 'X'
@@ -787,12 +833,14 @@ def register():
     bpy.types.Scene.calc_thickness = FloatProperty(name="Thickness", default=0.03)
     bpy.types.Scene.calc_double_sided = BoolProperty(name="Double Sided", default=True)
     bpy.types.Scene.calc_force_override = BoolProperty(name="Force Override", default=False)
+    bpy.types.Scene.align_tolerance = FloatProperty(name="Align Tolerance", default=0.005, min=0.0, description="Distance within which vertices are grouped for alignment")
 
 def unregister():
     del bpy.types.Scene.calc_density
     del bpy.types.Scene.calc_thickness
     del bpy.types.Scene.calc_double_sided
     del bpy.types.Scene.calc_force_override
+    del bpy.types.Scene.align_tolerance
     for cls in classes:
         bpy.utils.unregister_class(cls)
 
