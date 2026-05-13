@@ -17,6 +17,10 @@ Align vertices before rebuilding structural joints and nodes.
 
 Calculate weight and load directly from selected mesh objects.
 
+### Add-on Screenshot
+
+![Truss Add-on](truss_add_on.png)
+
 ## What it does
 
 - Converts solid beam geometry into centerline truss members
