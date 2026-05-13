@@ -720,32 +720,7 @@ class TRUSS_PT_MainPanel(bpy.types.Panel):
     def draw(self, context):
         layout = self.layout
         is_edit = (context.mode == 'EDIT_MESH')
-
-        # --- STEP 0: WEIGHT CALCULATOR ---
-        col = layout.column(align=True)
-        col.label(text="Step 0: Weight Calculator", icon='MOD_SIMPLEDEFORM')
-        col.prop(context.scene, "calc_density", text="Density (kg/m³)")
-        col.prop(context.scene, "calc_force_override", text="Force Manual Thickness")
-
-        if context.scene.calc_force_override:
-            box = col.box()
-            box.label(text="Geometry volume is ignored.", icon='ERROR')
-            box.prop(context.scene, "calc_thickness", text="Manual Thickness (m)")
-            box.prop(context.scene, "calc_double_sided", text="Double Sided Geometry")
-        else:
-            col.label(text="Uses geometric volume when available.", icon='INFO')
-
-        col.operator("truss.calculate_weight", text="Calculate Weight", icon='PHYSICS')
-
-        if context.scene.get("last_calc_weight") is not None:
-            box = col.box()
-            box.label(text=f"Selected Objects: {context.scene.get('last_obj_count', 0)}")
-            box.label(text=f"Total Weight: {context.scene['last_calc_weight']:.2f} kg")
-            row = box.row()
-            row.alert = True
-            row.label(text=f"Load: {context.scene['last_calc_force']:.2f} kN")
-            box.label(text=f"Method: {context.scene.get('last_calc_method', 'Unknown')}")
-        col.separator()
+        
         
         # --- HELPER BUTTON ---
         if not is_edit:
@@ -810,6 +785,42 @@ class TRUSS_PT_MainPanel(bpy.types.Panel):
         col.operator("truss.export_dxf", text="Export to DXF", icon='FILE_3D')
 
 
+class TRUSS_PT_WeightPanel(bpy.types.Panel):
+    """Separate Weight Calculator panel"""
+    bl_label = "Truss Weight Calculator"
+    bl_idname = "TRUSS_PT_weight"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "Truss"
+
+    def draw(self, context):
+        layout = self.layout
+        col = layout.column(align=True)
+        col.label(text="Weight Calculator", icon='MOD_SIMPLEDEFORM')
+        col.prop(context.scene, "calc_density", text="Density (kg/m³)")
+        col.prop(context.scene, "calc_force_override", text="Force Manual Thickness")
+
+        if context.scene.calc_force_override:
+            box = col.box()
+            box.label(text="Geometry volume is ignored.", icon='ERROR')
+            box.prop(context.scene, "calc_thickness", text="Manual Thickness (m)")
+            box.prop(context.scene, "calc_double_sided", text="Double Sided Geometry")
+        else:
+            col.label(text="Uses geometric volume when available.", icon='INFO')
+
+        col.operator("truss.calculate_weight", text="Calculate Weight", icon='PHYSICS')
+
+        if context.scene.get("last_calc_weight") is not None:
+            box = col.box()
+            box.label(text=f"Selected Objects: {context.scene.get('last_obj_count', 0)}")
+            box.label(text=f"Total Weight: {context.scene['last_calc_weight']:.2f} kg")
+            row = box.row()
+            row.alert = True
+            row.label(text=f"Load: {context.scene['last_calc_force']:.2f} kN")
+            box.label(text=f"Method: {context.scene.get('last_calc_method', 'Unknown')}")
+        col.separator()
+
+
 # ==============================================================================
 #   REGISTRATION
 # ==============================================================================
@@ -823,6 +834,7 @@ classes = (
     TRUSS_OT_RebuildIntersections,
     TRUSS_OT_SanityCheck,
     TRUSS_OT_ExportDXF,
+    TRUSS_PT_WeightPanel,
     TRUSS_PT_MainPanel,
 )
 
