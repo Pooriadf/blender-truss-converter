@@ -23,8 +23,12 @@ from bpy.props import StringProperty, FloatProperty, BoolProperty, EnumProperty
 def _beam_axis_pca(world_coords):
     """
     Given a list of world-space Vectors for a solid beam's vertices, returns
-    (center, unit_axis, half_length) via PCA. Handles diagonal beams correctly
-    unlike the bounding-box approach. Falls back to bbox for degenerate cases.
+    (center, unit_axis, half_length, aspect_ratio) via PCA.
+
+    aspect_ratio = primary_span / secondary_span. A true beam always has a much
+    longer primary axis than its cross-section, so this ratio is high (> 3).
+    Plates, blocks, and connection details have low ratios and should be skipped.
+    Falls back to bbox for degenerate point clouds.
     """
     if len(world_coords) < 2:
         return None
@@ -32,10 +36,16 @@ def _beam_axis_pca(world_coords):
     center = pts.mean(axis=0)
     centered = pts - center
     cov = centered.T @ centered
-    _, eigenvectors = np.linalg.eigh(cov)
-    axis = eigenvectors[:, -1]  # eigenvector of largest eigenvalue = primary axis
+    _, eigenvectors = np.linalg.eigh(cov)  # eigenvalues in ascending order
+    axis = eigenvectors[:, -1]   # largest eigenvalue → primary (length) axis
+    axis2 = eigenvectors[:, -2]  # second → cross-section axis
+
     projs = centered @ axis
     span = float(projs.max() - projs.min())
+
+    projs2 = centered @ axis2
+    span2 = max(float(projs2.max() - projs2.min()), 1e-6)
+
     if span < 1e-6:
         # Degenerate point cloud: fall back to bounding-box longest side
         mins, maxs = pts.min(axis=0), pts.max(axis=0)
@@ -44,10 +54,14 @@ def _beam_axis_pca(world_coords):
         axis = np.zeros(3)
         axis[ax] = 1.0
         span = float(spans[ax])
+        sorted_spans = sorted(spans.tolist())
+        span2 = max(sorted_spans[-2], 1e-6)
+
     return (
         mathutils.Vector(center.tolist()),
         mathutils.Vector(axis.tolist()).normalized(),
         span / 2.0,
+        span / span2,  # aspect ratio
     )
 
 
@@ -72,10 +86,24 @@ class TRUSS_OT_ConvertLines(bpy.types.Operator):
 
     weld_threshold: FloatProperty(
         name="Weld Threshold (m)",
-        default=0.005,
+        default=0.01,
         min=0.0001,
         max=0.1,
         description="Merge coincident beam endpoints within this distance"
+    )
+    min_length: FloatProperty(
+        name="Min Length (m)",
+        default=0.05,
+        min=0.001,
+        max=5.0,
+        description="Skip islands shorter than this — filters out bolts, small plates, connection details"
+    )
+    min_aspect_ratio: FloatProperty(
+        name="Min Aspect Ratio",
+        default=2.5,
+        min=1.0,
+        max=50.0,
+        description="Minimum length/width ratio — filters out blocks and plates that are not beams"
     )
 
     def execute(self, context):
@@ -87,6 +115,7 @@ class TRUSS_OT_ConvertLines(bpy.types.Operator):
         new_verts = []
         new_edges = []
         vert_index = 0
+        skipped = 0
         depsgraph = context.evaluated_depsgraph_get()
 
         for obj in selected_objs:
@@ -118,8 +147,13 @@ class TRUSS_OT_ConvertLines(bpy.types.Operator):
                 result = _beam_axis_pca(world_coords)
                 if result is None:
                     continue
-                center_w, axis_w, half_len = result
-                if half_len < 0.001:
+                center_w, axis_w, half_len, aspect = result
+
+                if half_len * 2 < self.min_length:
+                    skipped += 1
+                    continue
+                if aspect < self.min_aspect_ratio:
+                    skipped += 1
                     continue
 
                 new_verts.append(center_w - axis_w * half_len)
@@ -144,7 +178,7 @@ class TRUSS_OT_ConvertLines(bpy.types.Operator):
         new_obj.select_set(True)
         context.view_layer.objects.active = new_obj
 
-        self.report({'INFO'}, f"Converted {vert_index // 2} beams (PCA axis, auto-welded).")
+        self.report({'INFO'}, f"Converted {vert_index // 2} beams, skipped {skipped} non-beam islands.")
         return {'FINISHED'}
 
 
@@ -167,10 +201,24 @@ class TRUSS_OT_ConvertAssemblyLines(bpy.types.Operator):
     )
     weld_threshold: FloatProperty(
         name="Weld Threshold (m)",
-        default=0.005,
+        default=0.01,
         min=0.0001,
         max=0.1,
         description="Merge coincident beam endpoints within this distance"
+    )
+    min_length: FloatProperty(
+        name="Min Length (m)",
+        default=0.05,
+        min=0.001,
+        max=5.0,
+        description="Skip islands shorter than this — filters out bolts, small plates, connection details"
+    )
+    min_aspect_ratio: FloatProperty(
+        name="Min Aspect Ratio",
+        default=2.5,
+        min=1.0,
+        max=50.0,
+        description="Minimum length/width ratio — filters out blocks and plates that are not beams"
     )
 
     def execute(self, context):
@@ -182,6 +230,7 @@ class TRUSS_OT_ConvertAssemblyLines(bpy.types.Operator):
         new_verts = []
         new_edges = []
         vert_index = 0
+        skipped = 0
         depsgraph = context.evaluated_depsgraph_get()
 
         for obj in selected_objs:
@@ -253,13 +302,17 @@ class TRUSS_OT_ConvertAssemblyLines(bpy.types.Operator):
                     new_data.append(current)
                 island_data = new_data
 
-            # Use PCA on the merged vertex cloud for accurate axis detection
+            # Use PCA on the merged vertex cloud; apply beam-shape filters
             for data in island_data:
                 result = _beam_axis_pca(data["verts"])
                 if result is None:
                     continue
-                center_w, axis_w, half_len = result
-                if half_len < 0.001:
+                center_w, axis_w, half_len, aspect = result
+                if half_len * 2 < self.min_length:
+                    skipped += 1
+                    continue
+                if aspect < self.min_aspect_ratio:
+                    skipped += 1
                     continue
                 new_verts.append(center_w - axis_w * half_len)
                 new_verts.append(center_w + axis_w * half_len)
@@ -283,7 +336,7 @@ class TRUSS_OT_ConvertAssemblyLines(bpy.types.Operator):
         new_obj.select_set(True)
         context.view_layer.objects.active = new_obj
 
-        self.report({'INFO'}, f"Robust Conversion: {vert_index // 2} beams (PCA axis, auto-welded).")
+        self.report({'INFO'}, f"Converted {vert_index // 2} beams, skipped {skipped} non-beam islands.")
         return {'FINISHED'}
 
 
@@ -854,9 +907,28 @@ class TRUSS_OT_FullPipeline(bpy.types.Operator):
     )
     weld_threshold: FloatProperty(
         name="Weld Threshold (m)",
-        default=0.005, min=0.0001, max=0.1,
+        default=0.01, min=0.0001, max=0.1,
         description="Distance within which endpoints are welded together"
     )
+    min_length: FloatProperty(
+        name="Min Length (m)",
+        default=0.05, min=0.001, max=5.0,
+        description="Skip islands shorter than this — filters bolts, plates, connection details"
+    )
+    min_aspect_ratio: FloatProperty(
+        name="Min Aspect Ratio",
+        default=2.5, min=1.0, max=50.0,
+        description="Minimum length/width ratio — filters out non-beam geometry"
+    )
+
+    def invoke(self, context, _event):
+        sc = context.scene
+        self.align_axis = sc.pipeline_align_axis
+        self.max_extension = sc.pipeline_max_extension
+        self.weld_threshold = sc.pipeline_weld_threshold
+        self.min_length = sc.pipeline_min_length
+        self.min_aspect_ratio = sc.pipeline_min_aspect_ratio
+        return self.execute(context)
 
     def execute(self, context):
         # Ensure we start in object mode
@@ -869,11 +941,15 @@ class TRUSS_OT_FullPipeline(bpy.types.Operator):
                 'EXEC_DEFAULT',
                 merge_threshold=self.merge_threshold,
                 weld_threshold=self.weld_threshold,
+                min_length=self.min_length,
+                min_aspect_ratio=self.min_aspect_ratio,
             )
         else:
             result = bpy.ops.truss.convert_to_lines(
                 'EXEC_DEFAULT',
                 weld_threshold=self.weld_threshold,
+                min_length=self.min_length,
+                min_aspect_ratio=self.min_aspect_ratio,
             )
 
         if 'CANCELLED' in result:
@@ -931,13 +1007,12 @@ class TRUSS_PT_MainPanel(bpy.types.Panel):
         box.label(text="Select solid beams, then:", icon='INFO')
         box.operator("truss.full_pipeline", text="Run Full Auto Pipeline", icon='SHADERFX')
 
-        row = box.row(align=True)
-        row.label(text="Align:")
-        row.prop(sc, "pipeline_align_axis", text="")
-
-        row2 = box.row(align=True)
-        row2.prop(sc, "pipeline_max_extension", text="Extend")
-        row2.prop(sc, "pipeline_weld_threshold", text="Weld")
+        cfg = box.column(align=True)
+        cfg.prop(sc, "pipeline_align_axis", text="Align Axis")
+        cfg.prop(sc, "pipeline_min_length", text="Min Length (m)")
+        cfg.prop(sc, "pipeline_min_aspect_ratio", text="Min Aspect Ratio")
+        cfg.prop(sc, "pipeline_max_extension", text="Max Extension (m)")
+        cfg.prop(sc, "pipeline_weld_threshold", text="Weld Threshold (m)")
 
         layout.separator()
 
@@ -1106,12 +1181,20 @@ def register():
         name="Align Axis", items=ALIGN_AXIS_ITEMS, default='Z',
         description="Axis used by the full pipeline to cluster co-planar nodes"
     )
+    bpy.types.Scene.pipeline_min_length = FloatProperty(
+        name="Min Length", default=0.05, min=0.001, max=5.0,
+        description="Islands shorter than this are skipped — filters bolts, plates, connection details"
+    )
+    bpy.types.Scene.pipeline_min_aspect_ratio = FloatProperty(
+        name="Min Aspect Ratio", default=2.5, min=1.0, max=50.0,
+        description="Minimum length/width ratio — filters out blocks and plates that are not beams"
+    )
     bpy.types.Scene.pipeline_max_extension = FloatProperty(
         name="Max Extension", default=0.5, min=0.01, max=5.0,
         description="How far loose ends extend when connecting in the pipeline"
     )
     bpy.types.Scene.pipeline_weld_threshold = FloatProperty(
-        name="Weld Threshold", default=0.005, min=0.0001, max=0.1,
+        name="Weld Threshold", default=0.01, min=0.0001, max=0.1, precision=3,
         description="Merge distance used during pipeline auto-weld passes"
     )
 
@@ -1123,6 +1206,8 @@ def unregister():
     del bpy.types.Scene.calc_force_override
     del bpy.types.Scene.align_tolerance
     del bpy.types.Scene.pipeline_align_axis
+    del bpy.types.Scene.pipeline_min_length
+    del bpy.types.Scene.pipeline_min_aspect_ratio
     del bpy.types.Scene.pipeline_max_extension
     del bpy.types.Scene.pipeline_weld_threshold
     for cls in classes:
