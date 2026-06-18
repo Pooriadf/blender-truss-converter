@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Truss Analysis Master Suite",
     "author": "Pooria Danaeifar",
-    "version": (3, 0),
+    "version": (4, 0),
     "blender": (5, 0, 1),
     "location": "View3D > Sidebar > Truss",
     "description": "Complete FEA workflow: Convert, Align, Connect, Intersect, Check, and Export.",
@@ -11,18 +11,72 @@ bl_info = {
 import bpy
 import bmesh
 import mathutils
+import numpy as np
 from bpy_extras.io_utils import ExportHelper
-from bpy.props import StringProperty, FloatProperty, BoolProperty
+from bpy.props import StringProperty, FloatProperty, BoolProperty, EnumProperty
+
 
 # ==============================================================================
-#   OPERATOR 1A: STANDARD CONVERT (STRICT)
+#   HELPER: PCA BEAM AXIS DETECTION
+# ==============================================================================
+
+def _beam_axis_pca(world_coords):
+    """
+    Given a list of world-space Vectors for a solid beam's vertices, returns
+    (center, unit_axis, half_length) via PCA. Handles diagonal beams correctly
+    unlike the bounding-box approach. Falls back to bbox for degenerate cases.
+    """
+    if len(world_coords) < 2:
+        return None
+    pts = np.array([[c.x, c.y, c.z] for c in world_coords], dtype=np.float64)
+    center = pts.mean(axis=0)
+    centered = pts - center
+    cov = centered.T @ centered
+    _, eigenvectors = np.linalg.eigh(cov)
+    axis = eigenvectors[:, -1]  # eigenvector of largest eigenvalue = primary axis
+    projs = centered @ axis
+    span = float(projs.max() - projs.min())
+    if span < 1e-6:
+        # Degenerate point cloud: fall back to bounding-box longest side
+        mins, maxs = pts.min(axis=0), pts.max(axis=0)
+        spans = maxs - mins
+        ax = int(np.argmax(spans))
+        axis = np.zeros(3)
+        axis[ax] = 1.0
+        span = float(spans[ax])
+    return (
+        mathutils.Vector(center.tolist()),
+        mathutils.Vector(axis.tolist()).normalized(),
+        span / 2.0,
+    )
+
+
+def _weld_mesh(mesh_data, dist=0.005):
+    """Remove duplicate vertices within dist on a mesh data block."""
+    bm = bmesh.new()
+    bm.from_mesh(mesh_data)
+    bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=dist)
+    bm.to_mesh(mesh_data)
+    bm.free()
+
+
+# ==============================================================================
+#   OPERATOR 1A: STANDARD CONVERT (STRICT) — now uses PCA axis detection
 # ==============================================================================
 
 class TRUSS_OT_ConvertLines(bpy.types.Operator):
-    """Strictly converts each disjoint mesh island into its own centerline"""
+    """Converts each disjoint mesh island into its own centerline using PCA axis detection"""
     bl_idname = "truss.convert_to_lines"
     bl_label = "Convert Solid Beams"
     bl_options = {'REGISTER', 'UNDO'}
+
+    weld_threshold: FloatProperty(
+        name="Weld Threshold (m)",
+        default=0.005,
+        min=0.0001,
+        max=0.1,
+        description="Merge coincident beam endpoints within this distance"
+    )
 
     def execute(self, context):
         selected_objs = [obj for obj in context.selected_objects if obj.type == 'MESH']
@@ -34,17 +88,16 @@ class TRUSS_OT_ConvertLines(bpy.types.Operator):
         new_edges = []
         vert_index = 0
         depsgraph = context.evaluated_depsgraph_get()
-        
+
         for obj in selected_objs:
             matrix = obj.matrix_world
-            scale = matrix.to_scale()
             eval_obj = obj.evaluated_get(depsgraph)
             eval_mesh = eval_obj.to_mesh()
 
             bm = bmesh.new()
             bm.from_mesh(eval_mesh)
             verts_left = set(bm.verts)
-            
+
             while verts_left:
                 v = verts_left.pop()
                 island = [v]
@@ -57,71 +110,68 @@ class TRUSS_OT_ConvertLines(bpy.types.Operator):
                             verts_left.remove(other_v)
                             stack.append(other_v)
                             island.append(other_v)
-                
-                if len(island) < 2: continue
 
-                xs = [v.co.x for v in island]
-                ys = [v.co.y for v in island]
-                zs = [v.co.z for v in island]
-                
-                min_v = mathutils.Vector((min(xs), min(ys), min(zs)))
-                max_v = mathutils.Vector((max(xs), max(ys), max(zs)))
-                local_center = (min_v + max_v) / 2.0
+                if len(island) < 2:
+                    continue
 
-                dims = [
-                    (abs(max_v.x - min_v.x) * scale.x, abs(max_v.x - min_v.x), mathutils.Vector((1, 0, 0))), 
-                    (abs(max_v.y - min_v.y) * scale.y, abs(max_v.y - min_v.y), mathutils.Vector((0, 1, 0))), 
-                    (abs(max_v.z - min_v.z) * scale.z, abs(max_v.z - min_v.z), mathutils.Vector((0, 0, 1)))  
-                ]
-                world_len, local_len, local_axis = max(dims, key=lambda item: item[0])
+                world_coords = [matrix @ v.co for v in island]
+                result = _beam_axis_pca(world_coords)
+                if result is None:
+                    continue
+                center_w, axis_w, half_len = result
+                if half_len < 0.001:
+                    continue
 
-                if world_len < 0.001: continue 
-
-                half_vector = local_axis * (local_len / 2.0)
-                new_verts.append(matrix @ (local_center - half_vector))
-                new_verts.append(matrix @ (local_center + half_vector))
+                new_verts.append(center_w - axis_w * half_len)
+                new_verts.append(center_w + axis_w * half_len)
                 new_edges.append((vert_index, vert_index + 1))
                 vert_index += 2
 
             bm.free()
             eval_obj.to_mesh_clear()
 
-        if not new_verts: return {'CANCELLED'}
+        if not new_verts:
+            return {'CANCELLED'}
 
         mesh_data = bpy.data.meshes.new("Truss_Analysis_Data")
         mesh_data.from_pydata(new_verts, new_edges, [])
+        _weld_mesh(mesh_data, self.weld_threshold)
+
         new_obj = bpy.data.objects.new("Truss_Analysis_Lines", mesh_data)
         context.collection.objects.link(new_obj)
-        
+
         bpy.ops.object.select_all(action='DESELECT')
         new_obj.select_set(True)
         context.view_layer.objects.active = new_obj
-        
-        self.report({'INFO'}, f"Strict Conversion: {vert_index//2} lines.")
+
+        self.report({'INFO'}, f"Converted {vert_index // 2} beams (PCA axis, auto-welded).")
         return {'FINISHED'}
 
 
 # ==============================================================================
-#   OPERATOR 1B: ROBUST CONVERT (MERGES DISJOINT ASSEMBLIES)
+#   OPERATOR 1B: ROBUST CONVERT (MERGES DISJOINT ASSEMBLIES) — now uses PCA
 # ==============================================================================
 
 class TRUSS_OT_ConvertAssemblyLines(bpy.types.Operator):
-    """Merges disjoint shapes based on proximity before creating centerlines"""
+    """Merges disjoint shapes by proximity before creating PCA-based centerlines"""
     bl_idname = "truss.convert_assembly"
     bl_label = "Convert Multi-Part Beams"
     bl_options = {'REGISTER', 'UNDO'}
 
-    merge_threshold: bpy.props.FloatProperty(
+    merge_threshold: FloatProperty(
         name="Merge Threshold (m)",
         default=0.10,
         min=0.00,
         max=2.00,
         description="Distance within which disjoint parts are merged into one element"
     )
-
-    def draw(self, context):
-        layout = self.layout
-        layout.prop(self, "merge_threshold")
+    weld_threshold: FloatProperty(
+        name="Weld Threshold (m)",
+        default=0.005,
+        min=0.0001,
+        max=0.1,
+        description="Merge coincident beam endpoints within this distance"
+    )
 
     def execute(self, context):
         selected_objs = [obj for obj in context.selected_objects if obj.type == 'MESH']
@@ -133,10 +183,9 @@ class TRUSS_OT_ConvertAssemblyLines(bpy.types.Operator):
         new_edges = []
         vert_index = 0
         depsgraph = context.evaluated_depsgraph_get()
-        
+
         for obj in selected_objs:
             matrix = obj.matrix_world
-            scale = matrix.to_scale()
             eval_obj = obj.evaluated_get(depsgraph)
             eval_mesh = eval_obj.to_mesh()
 
@@ -159,15 +208,19 @@ class TRUSS_OT_ConvertAssemblyLines(bpy.types.Operator):
                             island_verts.append(other_v)
                 islands.append(island_verts)
 
+            # Build island data with both bbox (for merging) and world verts (for PCA)
             island_data = []
             for island in islands:
-                if len(island) < 2: continue
-                xs = [v.co.x for v in island]
-                ys = [v.co.y for v in island]
-                zs = [v.co.z for v in island]
+                if len(island) < 2:
+                    continue
+                world_verts = [matrix @ v.co for v in island]
+                xs = [w.x for w in world_verts]
+                ys = [w.y for w in world_verts]
+                zs = [w.z for w in world_verts]
                 island_data.append({
                     "min": mathutils.Vector((min(xs), min(ys), min(zs))),
-                    "max": mathutils.Vector((max(xs), max(ys), max(zs)))
+                    "max": mathutils.Vector((max(xs), max(ys), max(zs))),
+                    "verts": world_verts,
                 })
 
             def boxes_intersect(b1, b2, margin):
@@ -181,10 +234,12 @@ class TRUSS_OT_ConvertAssemblyLines(bpy.types.Operator):
                 new_data = []
                 skip = set()
                 for i in range(len(island_data)):
-                    if i in skip: continue
+                    if i in skip:
+                        continue
                     current = island_data[i]
                     for j in range(i + 1, len(island_data)):
-                        if j in skip: continue
+                        if j in skip:
+                            continue
                         if boxes_intersect(current, island_data[j], self.merge_threshold):
                             current["min"].x = min(current["min"].x, island_data[j]["min"].x)
                             current["min"].y = min(current["min"].y, island_data[j]["min"].y)
@@ -192,46 +247,43 @@ class TRUSS_OT_ConvertAssemblyLines(bpy.types.Operator):
                             current["max"].x = max(current["max"].x, island_data[j]["max"].x)
                             current["max"].y = max(current["max"].y, island_data[j]["max"].y)
                             current["max"].z = max(current["max"].z, island_data[j]["max"].z)
+                            current["verts"].extend(island_data[j]["verts"])
                             skip.add(j)
                             merged_any = True
                     new_data.append(current)
                 island_data = new_data
 
+            # Use PCA on the merged vertex cloud for accurate axis detection
             for data in island_data:
-                min_v = data["min"]
-                max_v = data["max"]
-                local_center = (min_v + max_v) / 2.0
-
-                dims = [
-                    (abs(max_v.x - min_v.x) * scale.x, abs(max_v.x - min_v.x), mathutils.Vector((1, 0, 0))), 
-                    (abs(max_v.y - min_v.y) * scale.y, abs(max_v.y - min_v.y), mathutils.Vector((0, 1, 0))), 
-                    (abs(max_v.z - min_v.z) * scale.z, abs(max_v.z - min_v.z), mathutils.Vector((0, 0, 1)))  
-                ]
-
-                world_len, local_len, local_axis = max(dims, key=lambda item: item[0])
-                if world_len < 0.001: continue 
-
-                half_vector = local_axis * (local_len / 2.0)
-                new_verts.append(matrix @ (local_center - half_vector))
-                new_verts.append(matrix @ (local_center + half_vector))
+                result = _beam_axis_pca(data["verts"])
+                if result is None:
+                    continue
+                center_w, axis_w, half_len = result
+                if half_len < 0.001:
+                    continue
+                new_verts.append(center_w - axis_w * half_len)
+                new_verts.append(center_w + axis_w * half_len)
                 new_edges.append((vert_index, vert_index + 1))
                 vert_index += 2
 
             bm.free()
             eval_obj.to_mesh_clear()
 
-        if not new_verts: return {'CANCELLED'}
+        if not new_verts:
+            return {'CANCELLED'}
 
         mesh_data = bpy.data.meshes.new("Truss_Assembly_Lines")
         mesh_data.from_pydata(new_verts, new_edges, [])
+        _weld_mesh(mesh_data, self.weld_threshold)
+
         new_obj = bpy.data.objects.new("Truss_Analysis_Lines", mesh_data)
         context.collection.objects.link(new_obj)
-        
+
         bpy.ops.object.select_all(action='DESELECT')
         new_obj.select_set(True)
         context.view_layer.objects.active = new_obj
-        
-        self.report({'INFO'}, f"Robust Conversion: {vert_index//2} lines created.")
+
+        self.report({'INFO'}, f"Robust Conversion: {vert_index // 2} beams (PCA axis, auto-welded).")
         return {'FINISHED'}
 
 
@@ -245,7 +297,7 @@ class TRUSS_OT_AlignVertices(bpy.types.Operator):
     bl_label = "Align Vertices"
     bl_options = {'REGISTER', 'UNDO'}
 
-    axis: bpy.props.StringProperty(
+    axis: StringProperty(
         name="Axis",
         description="Axis to align (X, Y, Z, XY, XZ, YZ)",
         default="Z"
@@ -259,20 +311,15 @@ class TRUSS_OT_AlignVertices(bpy.types.Operator):
         obj = context.edit_object
         bm = bmesh.from_edit_mesh(obj.data)
         bm.verts.ensure_lookup_table()
-        
+
         sel_verts = [v for v in bm.verts if v.select]
-
         tol = getattr(context.scene, "align_tolerance", 0.005)
-
-        # If all verts are selected, cluster by axis within tolerance
         all_selected = (len(sel_verts) == len(bm.verts))
 
         if len(sel_verts) < 2:
             self.report({'WARNING'}, "Select at least 2 vertices to align.")
             return {'CANCELLED'}
 
-        # Group-and-align when user selected all verts: cluster verts whose
-        # coordinate(s) are within the tolerance and align each cluster separately.
         if all_selected:
             groups = []
             for v in bm.verts:
@@ -292,14 +339,14 @@ class TRUSS_OT_AlignVertices(bpy.types.Operator):
 
             moved = 0
             for g in groups:
-                if len(g) < 2: continue
+                if len(g) < 2:
+                    continue
                 if 'X' in self.axis:
                     avg_x = sum(v.co.x for v in g) / len(g)
                 if 'Y' in self.axis:
                     avg_y = sum(v.co.y for v in g) / len(g)
                 if 'Z' in self.axis:
                     avg_z = sum(v.co.z for v in g) / len(g)
-
                 for v in g:
                     if 'X' in self.axis: v.co.x = avg_x
                     if 'Y' in self.axis: v.co.y = avg_y
@@ -307,10 +354,10 @@ class TRUSS_OT_AlignVertices(bpy.types.Operator):
                     moved += 1
 
             bmesh.update_edit_mesh(obj.data)
-            self.report({'INFO'}, f"Aligned {moved} vertices in {len([g for g in groups if len(g)>1])} clusters using tolerance {tol}.")
+            clusters = len([g for g in groups if len(g) > 1])
+            self.report({'INFO'}, f"Aligned {moved} vertices in {clusters} clusters (tol={tol}).")
             return {'FINISHED'}
 
-        # Otherwise fall back to original behaviour but use the tolerance
         avg_x = sum(v.co.x for v in sel_verts) / len(sel_verts)
         avg_y = sum(v.co.y for v in sel_verts) / len(sel_verts)
         avg_z = sum(v.co.z for v in sel_verts) / len(sel_verts)
@@ -342,8 +389,8 @@ class TRUSS_OT_ConnectLines(bpy.types.Operator):
     bl_idname = "truss.connect_lines"
     bl_label = "Connect/Extend Lines"
     bl_options = {'REGISTER', 'UNDO'}
-    
-    max_extension: bpy.props.FloatProperty(
+
+    max_extension: FloatProperty(
         name="Max Extension (m)",
         default=0.5,
         min=0.01,
@@ -381,7 +428,8 @@ class TRUSS_OT_ConnectLines(bpy.types.Operator):
             mode_msg = "all"
 
         if not loose_tips:
-            if not was_in_edit_mode: bpy.ops.object.mode_set(mode='OBJECT')
+            if not was_in_edit_mode:
+                bpy.ops.object.mode_set(mode='OBJECT')
             return {'CANCELLED'}
 
         verts_to_move = {}
@@ -392,29 +440,31 @@ class TRUSS_OT_ConnectLines(bpy.types.Operator):
             edge = tip.link_edges[0]
             other_v = edge.other_vert(tip)
             other_v_world = obj.matrix_world @ other_v.co
-            
+
             direction = (tip_co_world - other_v_world).normalized()
             best_hit_location = None
             min_dist = self.max_extension
-            
+
             for (p1, p2, target_edge) in target_edges:
-                if target_edge == edge: continue
-                
+                if target_edge == edge:
+                    continue
+
                 line_a_p1 = tip_co_world
                 line_a_p2 = tip_co_world + (direction * self.max_extension)
-                
+
                 res = mathutils.geometry.intersect_line_line(line_a_p1, line_a_p2, p1, p2)
-                if res is None: continue 
-                
+                if res is None:
+                    continue
+
                 pa, pb = res
-                
+
                 len_segment = (p2 - p1).length
                 dist_p1 = (pb - p1).length
                 dist_p2 = (pb - p2).length
-                
+
                 if dist_p1 <= len_segment + 0.01 and dist_p2 <= len_segment + 0.01:
                     vec_to_hit = pa - tip_co_world
-                    if vec_to_hit.dot(direction) > 0: 
+                    if vec_to_hit.dot(direction) > 0:
                         hit_dist = vec_to_hit.length
                         gap = (pa - pb).length
                         if hit_dist < min_dist and gap < 0.1:
@@ -428,12 +478,12 @@ class TRUSS_OT_ConnectLines(bpy.types.Operator):
 
         for v, pos in verts_to_move.items():
             v.co = pos
-            
+
         bmesh.update_edit_mesh(obj.data)
-        
+
         if not was_in_edit_mode:
             bpy.ops.object.mode_set(mode='OBJECT')
-        
+
         self.report({'INFO'}, f"Extended and connected {extended_count} {mode_msg} loose ends.")
         return {'FINISHED'}
 
@@ -449,7 +499,7 @@ class TRUSS_OT_RebuildIntersections(bpy.types.Operator):
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
-        if context.active_object.mode != 'EDIT':
+        if context.mode != 'EDIT_MESH':
             self.report({'WARNING'}, "Please enter Edit Mode and select lines.")
             return {'CANCELLED'}
 
@@ -468,81 +518,87 @@ class TRUSS_OT_RebuildIntersections(bpy.types.Operator):
                     "v2": e.verts[1],
                     "p1": e.verts[0].co.copy(),
                     "p2": e.verts[1].co.copy(),
-                    "split_points": [] 
+                    "split_points": []
                 })
 
-        if len(edges_to_process) < 2: return {'CANCELLED'}
+        if len(edges_to_process) < 2:
+            return {'CANCELLED'}
 
         count = 0
         for i in range(len(edges_to_process)):
             for j in range(i + 1, len(edges_to_process)):
                 item1 = edges_to_process[i]
                 item2 = edges_to_process[j]
-                
+
                 res = mathutils.geometry.intersect_line_line(item1["p1"], item1["p2"], item2["p1"], item2["p2"])
-                if res is None: continue
-                
+                if res is None:
+                    continue
+
                 p_on_1, p_on_2 = res
-                if (p_on_1 - p_on_2).length > 0.05: continue 
-                
+                if (p_on_1 - p_on_2).length > 0.05:
+                    continue
+
                 mid_point = (p_on_1 + p_on_2) / 2
-                
+
                 len1 = (item1["p1"] - item1["p2"]).length
                 dist1 = (mid_point - item1["p1"]).length + (mid_point - item1["p2"]).length
-                
+
                 len2 = (item2["p1"] - item2["p2"]).length
                 dist2 = (mid_point - item2["p1"]).length + (mid_point - item2["p2"]).length
-                
+
                 if dist1 <= len1 + 0.001 and dist2 <= len2 + 0.001:
                     d_start1 = (mid_point - item1["p1"]).length
                     d_end1 = (mid_point - item1["p2"]).length
                     if d_start1 > 0.01 and d_end1 > 0.01:
                         item1["split_points"].append(mid_point)
-                        
+
                     d_start2 = (mid_point - item2["p1"]).length
                     d_end2 = (mid_point - item2["p2"]).length
                     if d_start2 > 0.01 and d_end2 > 0.01:
                         item2["split_points"].append(mid_point)
-                        
+
                     count += 1
 
-        if count == 0: return {'CANCELLED'}
+        if count == 0:
+            return {'CANCELLED'}
 
         edges_to_delete = []
         for item in edges_to_process:
             splits = item["split_points"]
-            if not splits: continue
-            
+            if not splits:
+                continue
+
             start_co = item["p1"]
             splits.sort(key=lambda p: (p - start_co).length)
             chain_coords = [start_co] + splits + [item["p2"]]
             prev_vert = item["v1"]
-            
+
             for k in range(1, len(chain_coords)):
                 coord = chain_coords[k]
                 target_vert = item["v2"] if k == len(chain_coords) - 1 else bm.verts.new(coord)
                 try:
                     bm.edges.new((prev_vert, target_vert))
-                except ValueError: pass 
+                except ValueError:
+                    pass
                 prev_vert = target_vert
-            
+
             edges_to_delete.append(item["edge"])
 
         bmesh.ops.delete(bm, geom=edges_to_delete, context='EDGES')
         bpy.ops.mesh.select_all(action='SELECT')
         bpy.ops.mesh.remove_doubles(threshold=0.001)
-        
+
         bmesh.update_edit_mesh(me)
-        self.report({'INFO'}, f"Success! Rebuilt truss with {count} intersections.")
+        self.report({'INFO'}, f"Rebuilt truss with {count} intersections.")
         return {'FINISHED'}
 
 
 # ==============================================================================
-#   OPERATOR 5: SANITY CHECK (DIAGNOSTICS)
+#   OPERATOR 5: SANITY CHECK + STATISTICS
 # ==============================================================================
 
 class TRUSS_OT_SanityCheck(bpy.types.Operator):
-    """Highlights problem geometry (micro-edges and floating vertices)"""
+    """Highlights problem geometry and reports full model statistics"""
     bl_idname = "truss.sanity_check"
     bl_label = "Run Sanity Check"
     bl_options = {'REGISTER', 'UNDO'}
@@ -554,33 +610,93 @@ class TRUSS_OT_SanityCheck(bpy.types.Operator):
 
         obj = context.edit_object
         bm = bmesh.from_edit_mesh(obj.data)
-        
-        # Deselect everything first
-        bpy.ops.mesh.select_all(action='DESELECT')
-        
-        issues_found = 0
+        bm.verts.ensure_lookup_table()
+        bm.edges.ensure_lookup_table()
 
-        # Check 1: Find Micro-Edges (shorter than 1mm)
+        bpy.ops.mesh.select_all(action='DESELECT')
+
+        micro_edges = 0
+        floating_verts = 0
+        loose_ends = 0
+        duplicate_edges = 0
+
+        # Check 1: Micro-edges (< 1 mm)
         for e in bm.edges:
             if e.calc_length() < 0.001:
                 e.select = True
                 e.verts[0].select = True
                 e.verts[1].select = True
-                issues_found += 1
+                micro_edges += 1
 
-        # Check 2: Find completely floating vertices
+        # Check 2: Floating vertices (no edges)
         for v in bm.verts:
             if len(v.link_edges) == 0:
                 v.select = True
-                issues_found += 1
+                floating_verts += 1
+
+        # Check 3: Loose ends (1 edge — free tip, likely a missing connection)
+        for v in bm.verts:
+            if len(v.link_edges) == 1:
+                v.select = True
+                loose_ends += 1
+
+        # Check 4: Duplicate edges (same vertex pair)
+        seen_pairs = set()
+        for e in bm.edges:
+            key = tuple(sorted([e.verts[0].index, e.verts[1].index]))
+            if key in seen_pairs:
+                e.select = True
+                duplicate_edges += 1
+            else:
+                seen_pairs.add(key)
+
+        # Check 5: Count disconnected sub-graphs (islands)
+        visited = set()
+        island_count = 0
+        for v in bm.verts:
+            if v not in visited:
+                island_count += 1
+                stack = [v]
+                while stack:
+                    curr = stack.pop()
+                    if curr in visited:
+                        continue
+                    visited.add(curr)
+                    for e in curr.link_edges:
+                        other = e.other_vert(curr)
+                        if other not in visited:
+                            stack.append(other)
+
+        # Model statistics
+        total_members = len(bm.edges)
+        total_nodes = len([v for v in bm.verts if len(v.link_edges) > 0])
+        edge_lengths = [e.calc_length() for e in bm.edges] if bm.edges else [0.0]
+        total_length = sum(edge_lengths)
+        max_len = max(edge_lengths)
+        min_len = min(e for e in edge_lengths if e > 0.001) if any(e > 0.001 for e in edge_lengths) else 0.0
+
+        # Store all results in scene for panel display
+        context.scene["sc_micro_edges"] = micro_edges
+        context.scene["sc_floating_verts"] = floating_verts
+        context.scene["sc_loose_ends"] = loose_ends
+        context.scene["sc_duplicate_edges"] = duplicate_edges
+        context.scene["sc_islands"] = island_count
+        context.scene["sc_total_members"] = total_members
+        context.scene["sc_total_nodes"] = total_nodes
+        context.scene["sc_total_length"] = round(total_length, 4)
+        context.scene["sc_max_len"] = round(max_len, 4)
+        context.scene["sc_min_len"] = round(min_len, 4)
 
         bmesh.update_edit_mesh(obj.data)
 
-        if issues_found > 0:
-            self.report({'WARNING'}, f"Found {issues_found} issues! Problematic geometry has been selected.")
+        critical = micro_edges + floating_verts + duplicate_edges
+        if critical > 0:
+            self.report({'WARNING'}, f"{critical} critical issues found — problematic geometry is selected.")
+        elif loose_ends > 0:
+            self.report({'INFO'}, f"Geometry clean. {loose_ends} loose ends detected — verify they are intentional.")
         else:
-            self.report({'INFO'}, "Passed! Truss geometry is clean and FEA ready.")
-            
+            self.report({'INFO'}, f"PASSED! {total_members} members, {total_nodes} nodes. FEA ready.")
+
         return {'FINISHED'}
 
 
@@ -657,60 +773,147 @@ class TRUSS_OT_ExportDXF(bpy.types.Operator, ExportHelper):
     """Exports the truss lines directly to a clean 3D DXF file"""
     bl_idname = "truss.export_dxf"
     bl_label = "Export DXF"
-    
+
     filename_ext = ".dxf"
-    filter_glob: StringProperty(
-        default="*.dxf",
-        options={'HIDDEN'},
-        maxlen=255, 
-    )
+    filter_glob: StringProperty(default="*.dxf", options={'HIDDEN'}, maxlen=255)
 
     def execute(self, context):
         obj = context.active_object
         if not obj or obj.type != 'MESH':
             self.report({'WARNING'}, "Please select the truss line object.")
             return {'CANCELLED'}
-        
+
         was_in_edit_mode = (context.mode == 'EDIT_MESH')
         if was_in_edit_mode:
             bpy.ops.object.mode_set(mode='OBJECT')
-            
+
         mesh = obj.data
         mat = obj.matrix_world
-        
+
         try:
             with open(self.filepath, 'w') as f:
-                # Write minimal DXF Header for Lines
                 f.write("0\nSECTION\n2\nENTITIES\n")
-                
-                # Write all edges
                 for edge in mesh.edges:
                     p1 = mat @ mesh.vertices[edge.vertices[0]].co
                     p2 = mat @ mesh.vertices[edge.vertices[1]].co
-                    
                     f.write("0\nLINE\n8\nTruss_Lines\n")
                     f.write(f"10\n{p1.x}\n20\n{p1.y}\n30\n{p1.z}\n")
                     f.write(f"11\n{p2.x}\n21\n{p2.y}\n31\n{p2.z}\n")
-                    
                 f.write("0\nENDSEC\n0\nEOF\n")
-                
-            self.report({'INFO'}, f"Successfully exported to: {self.filepath}")
-            
+            self.report({'INFO'}, f"Exported to: {self.filepath}")
         except Exception as e:
             self.report({'ERROR'}, f"Failed to export: {str(e)}")
-            
+
         if was_in_edit_mode:
             bpy.ops.object.mode_set(mode='EDIT')
-            
+
         return {'FINISHED'}
 
 
 # ==============================================================================
-#   UI PANEL
+#   OPERATOR 8: FULL AUTO PIPELINE
+# ==============================================================================
+
+ALIGN_AXIS_ITEMS = [
+    ('Z',    "Z",    "Align on Z (vertical — most common for structural)"),
+    ('Y',    "Y",    "Align on Y"),
+    ('X',    "X",    "Align on X"),
+    ('XY',   "XY",   "Align on X and Y"),
+    ('XZ',   "XZ",   "Align on X and Z"),
+    ('YZ',   "YZ",   "Align on Y and Z"),
+    ('SKIP', "Skip", "Do not run vertex alignment"),
+]
+
+
+class TRUSS_OT_FullPipeline(bpy.types.Operator):
+    """One-click workflow: Convert → Align → Connect → Rebuild → Check"""
+    bl_idname = "truss.full_pipeline"
+    bl_label = "Run Full Auto Pipeline"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    use_assembly: BoolProperty(
+        name="Multi-Part Beams",
+        default=False,
+        description="Use proximity-merge conversion instead of strict island conversion"
+    )
+    merge_threshold: FloatProperty(
+        name="Merge Threshold (m)",
+        default=0.10, min=0.0, max=2.0,
+        description="Part proximity for multi-part merge"
+    )
+    align_axis: EnumProperty(
+        name="Align Axis",
+        items=ALIGN_AXIS_ITEMS,
+        default='Z',
+        description="Axis on which to cluster and snap co-planar nodes"
+    )
+    max_extension: FloatProperty(
+        name="Max Extension (m)",
+        default=0.5, min=0.01, max=5.0,
+        description="How far a loose end can extend to find a target beam"
+    )
+    weld_threshold: FloatProperty(
+        name="Weld Threshold (m)",
+        default=0.005, min=0.0001, max=0.1,
+        description="Distance within which endpoints are welded together"
+    )
+
+    def execute(self, context):
+        # Ensure we start in object mode
+        if context.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+
+        # Step 1: Convert solid beams to centerlines
+        if self.use_assembly:
+            result = bpy.ops.truss.convert_assembly(
+                'EXEC_DEFAULT',
+                merge_threshold=self.merge_threshold,
+                weld_threshold=self.weld_threshold,
+            )
+        else:
+            result = bpy.ops.truss.convert_to_lines(
+                'EXEC_DEFAULT',
+                weld_threshold=self.weld_threshold,
+            )
+
+        if 'CANCELLED' in result:
+            self.report({'ERROR'}, "Conversion failed — select solid beam mesh objects first.")
+            return {'CANCELLED'}
+
+        # Step 2: Enter edit mode and align nodes
+        bpy.ops.object.mode_set(mode='EDIT')
+        bpy.ops.mesh.select_all(action='SELECT')
+
+        if self.align_axis != 'SKIP':
+            bpy.ops.truss.align_vertices('EXEC_DEFAULT', axis=self.align_axis)
+
+        # Step 3: Connect loose ends
+        bpy.ops.truss.connect_lines('EXEC_DEFAULT', max_extension=self.max_extension)
+
+        # Step 4: Weld close vertices
+        bpy.ops.mesh.select_all(action='SELECT')
+        bpy.ops.mesh.remove_doubles(threshold=self.weld_threshold)
+
+        # Step 5: Rebuild intersections
+        bpy.ops.mesh.select_all(action='SELECT')
+        bpy.ops.truss.rebuild_intersections('EXEC_DEFAULT')
+
+        # Step 6: Final weld pass
+        bpy.ops.mesh.select_all(action='SELECT')
+        bpy.ops.mesh.remove_doubles(threshold=self.weld_threshold)
+
+        # Step 7: Sanity check + statistics
+        bpy.ops.truss.sanity_check('EXEC_DEFAULT')
+
+        self.report({'INFO'}, "Full pipeline complete! Review the diagnostics below.")
+        return {'FINISHED'}
+
+
+# ==============================================================================
+#   UI PANELS
 # ==============================================================================
 
 class TRUSS_PT_MainPanel(bpy.types.Panel):
-    """Creates a Panel in the View3D UI Sidebar"""
     bl_label = "Truss Master Tools"
     bl_idname = "TRUSS_PT_main"
     bl_space_type = 'VIEW_3D'
@@ -720,9 +923,24 @@ class TRUSS_PT_MainPanel(bpy.types.Panel):
     def draw(self, context):
         layout = self.layout
         is_edit = (context.mode == 'EDIT_MESH')
-        
-        
-        # --- HELPER BUTTON ---
+        sc = context.scene
+
+        # --- AUTO PIPELINE ---
+        box = layout.box()
+        box.label(text="Auto Pipeline", icon='PLAY')
+        box.label(text="Select solid beams, then:", icon='INFO')
+        box.operator("truss.full_pipeline", text="Run Full Auto Pipeline", icon='SHADERFX')
+
+        row = box.row(align=True)
+        row.label(text="Align:")
+        row.prop(sc, "pipeline_align_axis", text="")
+
+        row2 = box.row(align=True)
+        row2.prop(sc, "pipeline_max_extension", text="Extend")
+        row2.prop(sc, "pipeline_weld_threshold", text="Weld")
+
+        layout.separator()
+
         if not is_edit:
             layout.operator("object.editmode_toggle", text="Enter Edit Mode for Geometry Tools", icon='EDITMODE_HLT')
             layout.separator()
@@ -733,24 +951,24 @@ class TRUSS_PT_MainPanel(bpy.types.Panel):
         col.operator("truss.convert_to_lines", text="Convert Solid Beams", icon='CURVE_DATA')
         col.operator("truss.convert_assembly", text="Convert Multi-Part Beams", icon='GROUP')
         col.separator()
-        
+
         # --- STEP 2: ALIGN ---
         col = layout.column(align=True)
         col.label(text="Step 2: Align Nodes", icon='SNAP_VERTEX')
-        
+
         align_col = col.column(align=True)
         align_col.active = is_edit
-        align_col.prop(context.scene, "align_tolerance", text="Tolerance (m)")
-        
+        align_col.prop(sc, "align_tolerance", text="Tolerance (m)")
+
         row = align_col.row(align=True)
-        row.operator("truss.align_vertices", text="Align X").axis = 'X'
-        row.operator("truss.align_vertices", text="Align Y").axis = 'Y'
-        row.operator("truss.align_vertices", text="Align Z").axis = 'Z'
-        
+        row.operator("truss.align_vertices", text="X").axis = 'X'
+        row.operator("truss.align_vertices", text="Y").axis = 'Y'
+        row.operator("truss.align_vertices", text="Z").axis = 'Z'
+
         row2 = align_col.row(align=True)
-        row2.operator("truss.align_vertices", text="Align YZ").axis = 'YZ'
-        row2.operator("truss.align_vertices", text="Align XZ").axis = 'XZ'
-        row2.operator("truss.align_vertices", text="Align XY").axis = 'XY'
+        row2.operator("truss.align_vertices", text="YZ").axis = 'YZ'
+        row2.operator("truss.align_vertices", text="XZ").axis = 'XZ'
+        row2.operator("truss.align_vertices", text="XY").axis = 'XY'
         col.separator()
 
         # --- STEP 3: CONNECT ---
@@ -758,27 +976,60 @@ class TRUSS_PT_MainPanel(bpy.types.Panel):
         col.label(text="Step 3: Clean Gaps", icon='SNAP_ON')
         col.operator("truss.connect_lines", text="Extend & Connect", icon='DRIVER')
         col.separator()
-        
+
         # --- STEP 4: INTERSECTIONS ---
         col = layout.column(align=True)
         col.label(text="Step 4: Structural Nodes", icon='VERTEXSEL')
-        
         edit_col = col.column(align=True)
         edit_col.active = is_edit
         edit_col.operator("truss.rebuild_intersections", text="Rebuild Intersections", icon='MOD_BOOLEAN')
         edit_col.label(text="(Select ALL lines first)", icon='INFO')
         col.separator()
-            
-        # --- STEP 5: SANITY CHECK ---
+
+        # --- STEP 5: SANITY CHECK + STATS ---
         col = layout.column(align=True)
         col.label(text="Step 5: Sanity Check", icon='VIEWZOOM')
-        
         check_col = col.column(align=True)
         check_col.active = is_edit
         check_col.operator("truss.sanity_check", text="Run Diagnostics", icon='CHECKMARK')
-        check_col.label(text="(Highlights invalid geometry)", icon='INFO')
-        col.separator()
-        
+
+        if sc.get("sc_total_members") is not None:
+            res = layout.box()
+            critical = (sc.get("sc_micro_edges", 0) +
+                        sc.get("sc_floating_verts", 0) +
+                        sc.get("sc_duplicate_edges", 0))
+
+            if critical > 0:
+                err_row = res.row()
+                err_row.alert = True
+                err_row.label(text=f"Critical issues: {critical}", icon='ERROR')
+                if sc.get("sc_micro_edges", 0):
+                    res.label(text=f"  Micro-edges: {sc['sc_micro_edges']}")
+                if sc.get("sc_duplicate_edges", 0):
+                    res.label(text=f"  Duplicate edges: {sc['sc_duplicate_edges']}")
+                if sc.get("sc_floating_verts", 0):
+                    res.label(text=f"  Floating verts: {sc['sc_floating_verts']}")
+            else:
+                res.label(text="No critical issues", icon='CHECKMARK')
+
+            loose = sc.get("sc_loose_ends", 0)
+            if loose:
+                res.label(text=f"Loose ends: {loose}  (check if intentional)", icon='INFO')
+
+            res.separator()
+            res.label(text="Model Statistics", icon='MESH_DATA')
+            split = res.split(factor=0.5)
+            col_l = split.column()
+            col_r = split.column()
+            col_l.label(text=f"Members: {sc.get('sc_total_members', 0)}")
+            col_r.label(text=f"Nodes: {sc.get('sc_total_nodes', 0)}")
+            col_l.label(text=f"Sub-graphs: {sc.get('sc_islands', 0)}")
+            col_r.label(text=f"Length: {sc.get('sc_total_length', 0):.2f} m")
+            col_l.label(text=f"Max span: {sc.get('sc_max_len', 0):.3f} m")
+            col_r.label(text=f"Min span: {sc.get('sc_min_len', 0):.3f} m")
+
+        layout.separator()
+
         # --- STEP 6: EXPORT ---
         col = layout.column(align=True)
         col.label(text="Step 6: Export", icon='EXPORT')
@@ -786,7 +1037,6 @@ class TRUSS_PT_MainPanel(bpy.types.Panel):
 
 
 class TRUSS_PT_WeightPanel(bpy.types.Panel):
-    """Separate Weight Calculator panel"""
     bl_label = "Truss Weight Calculator"
     bl_idname = "TRUSS_PT_weight"
     bl_space_type = 'VIEW_3D'
@@ -834,18 +1084,37 @@ classes = (
     TRUSS_OT_RebuildIntersections,
     TRUSS_OT_SanityCheck,
     TRUSS_OT_ExportDXF,
+    TRUSS_OT_FullPipeline,
     TRUSS_PT_WeightPanel,
     TRUSS_PT_MainPanel,
 )
 
+
 def register():
     for cls in classes:
         bpy.utils.register_class(cls)
+
     bpy.types.Scene.calc_density = FloatProperty(name="Density", default=2700.0)
     bpy.types.Scene.calc_thickness = FloatProperty(name="Thickness", default=0.03)
     bpy.types.Scene.calc_double_sided = BoolProperty(name="Double Sided", default=True)
     bpy.types.Scene.calc_force_override = BoolProperty(name="Force Override", default=False)
-    bpy.types.Scene.align_tolerance = FloatProperty(name="Align Tolerance", default=0.005, min=0.0, description="Distance within which vertices are grouped for alignment")
+    bpy.types.Scene.align_tolerance = FloatProperty(
+        name="Align Tolerance", default=0.005, min=0.0,
+        description="Distance within which vertices are grouped for alignment"
+    )
+    bpy.types.Scene.pipeline_align_axis = EnumProperty(
+        name="Align Axis", items=ALIGN_AXIS_ITEMS, default='Z',
+        description="Axis used by the full pipeline to cluster co-planar nodes"
+    )
+    bpy.types.Scene.pipeline_max_extension = FloatProperty(
+        name="Max Extension", default=0.5, min=0.01, max=5.0,
+        description="How far loose ends extend when connecting in the pipeline"
+    )
+    bpy.types.Scene.pipeline_weld_threshold = FloatProperty(
+        name="Weld Threshold", default=0.005, min=0.0001, max=0.1,
+        description="Merge distance used during pipeline auto-weld passes"
+    )
+
 
 def unregister():
     del bpy.types.Scene.calc_density
@@ -853,8 +1122,12 @@ def unregister():
     del bpy.types.Scene.calc_double_sided
     del bpy.types.Scene.calc_force_override
     del bpy.types.Scene.align_tolerance
+    del bpy.types.Scene.pipeline_align_axis
+    del bpy.types.Scene.pipeline_max_extension
+    del bpy.types.Scene.pipeline_weld_threshold
     for cls in classes:
         bpy.utils.unregister_class(cls)
+
 
 if __name__ == "__main__":
     register()
