@@ -434,6 +434,135 @@ class TRUSS_OT_AlignVertices(bpy.types.Operator):
 
 
 # ==============================================================================
+#   OPERATOR 2B: SMART AUTO-ALIGN (ALL AXES + OPTIONAL SYMMETRY)
+# ==============================================================================
+
+class TRUSS_OT_SmartAutoAlign(bpy.types.Operator):
+    """
+    Aligns vertices automatically: Z first (levels), then X and Y (grid).
+    Uses sorted transitive clustering so any vertices within tolerance of their
+    neighbour end up in the same cluster — more robust than the greedy approach.
+    Optionally enforces exact structural symmetry by mirror-matching vertex pairs.
+    """
+    bl_idname = "truss.smart_auto_align"
+    bl_label = "Smart Auto-Align All"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    enforce_symmetry: BoolProperty(
+        name="Enforce Symmetry",
+        default=False,
+        description="After alignment, snap near-symmetric vertex pairs to exact mirror positions about the centroid"
+    )
+    sym_axis: EnumProperty(
+        name="Symmetry Axis",
+        items=[
+            ('X', "X", "Symmetric about X=centroid (left/right)"),
+            ('Y', "Y", "Symmetric about Y=centroid (front/back)"),
+        ],
+        default='X',
+        description="Axis about which the structure is structurally symmetric"
+    )
+
+    @staticmethod
+    def _cluster_axis(verts, ax, tol):
+        """
+        Sort by axis value and cluster transitively: each vertex joins the current
+        group if it is within tol of the LAST member (not just the first/representative).
+        This correctly groups vertices that drift gradually within the tolerance band.
+        """
+        sorted_v = sorted(verts, key=lambda v: getattr(v.co, ax))
+        if not sorted_v:
+            return []
+        groups = [[sorted_v[0]]]
+        for v in sorted_v[1:]:
+            if abs(getattr(v.co, ax) - getattr(groups[-1][-1].co, ax)) <= tol:
+                groups[-1].append(v)
+            else:
+                groups.append([v])
+        return groups
+
+    def execute(self, context):
+        if context.mode != 'EDIT_MESH':
+            self.report({'WARNING'}, "Must be in Edit Mode.")
+            return {'CANCELLED'}
+
+        obj = context.edit_object
+        bm = bmesh.from_edit_mesh(obj.data)
+        bm.verts.ensure_lookup_table()
+
+        sel_verts = [v for v in bm.verts if v.select]
+        if len(sel_verts) < 2:
+            self.report({'WARNING'}, "Select at least 2 vertices.")
+            return {'CANCELLED'}
+
+        tol = context.scene.align_tolerance
+        total_clusters = 0
+
+        # Align Z first (structural levels), then X and Y (horizontal grid positions)
+        for ax in ('z', 'x', 'y'):
+            for g in self._cluster_axis(sel_verts, ax, tol):
+                if len(g) < 2:
+                    continue
+                avg = sum(getattr(v.co, ax) for v in g) / len(g)
+                for v in g:
+                    setattr(v.co, ax, avg)
+                total_clusters += 1
+
+        # Optional symmetry enforcement
+        sym_report = ""
+        if self.enforce_symmetry:
+            sym_ax = self.sym_axis.lower()
+            other_axes = [a for a in ('x', 'y', 'z') if a != sym_ax]
+
+            # Use centroid along the symmetry axis as the mirror plane
+            center = sum(getattr(v.co, sym_ax) for v in sel_verts) / len(sel_verts)
+
+            paired = set()
+            snapped = 0
+            # Use slightly relaxed tolerance for symmetry matching (vertices may not
+            # be perfectly symmetric before this step)
+            sym_tol = tol * 3
+
+            for v in sel_verts:
+                if id(v) in paired:
+                    continue
+                c = getattr(v.co, sym_ax)
+                mirror_c = 2.0 * center - c
+
+                best = None
+                best_dist = sym_tol
+                for u in sel_verts:
+                    if id(u) == id(v) or id(u) in paired:
+                        continue
+                    uc = getattr(u.co, sym_ax)
+                    if abs(uc - mirror_c) >= best_dist:
+                        continue
+                    # Candidate must also match on other axes within a wider band
+                    if not all(abs(getattr(u.co, a) - getattr(v.co, a)) <= tol * 4 for a in other_axes):
+                        continue
+                    best_dist = abs(uc - mirror_c)
+                    best = u
+
+                if best is not None:
+                    # Average both distances from center → enforce exact mirror
+                    d = (abs(c - center) + abs(getattr(best.co, sym_ax) - center)) / 2.0
+                    setattr(v.co, sym_ax, center + d * (1.0 if c >= center else -1.0))
+                    setattr(best.co, sym_ax, center - d * (1.0 if c >= center else -1.0))
+                    paired.add(id(v))
+                    paired.add(id(best))
+                    snapped += 2
+
+            if snapped:
+                sym_report = f", {snapped} vertices snapped to {self.sym_axis}-symmetry (center={center:.3f} m)"
+            else:
+                sym_report = f" (no symmetric pairs found within {sym_tol:.4f} m)"
+
+        bmesh.update_edit_mesh(obj.data)
+        self.report({'INFO'}, f"Auto-aligned {total_clusters} clusters on Z/X/Y{sym_report}.")
+        return {'FINISHED'}
+
+
+# ==============================================================================
 #   OPERATOR 3: CONNECT & EXTEND LINES (FIX GAPS)
 # ==============================================================================
 
@@ -868,6 +997,7 @@ class TRUSS_OT_ExportDXF(bpy.types.Operator, ExportHelper):
 # ==============================================================================
 
 ALIGN_AXIS_ITEMS = [
+    ('AUTO', "Auto (All Axes)", "Smart auto-align: Z → X → Y in sequence (recommended for pipeline)"),
     ('Z',    "Z",    "Align on Z (vertical — most common for structural)"),
     ('Y',    "Y",    "Align on Y"),
     ('X',    "X",    "Align on X"),
@@ -875,6 +1005,11 @@ ALIGN_AXIS_ITEMS = [
     ('XZ',   "XZ",   "Align on X and Z"),
     ('YZ',   "YZ",   "Align on Y and Z"),
     ('SKIP', "Skip", "Do not run vertex alignment"),
+]
+
+SYM_AXIS_ITEMS = [
+    ('X', "X", "Symmetric about X=centroid (left/right mirror)"),
+    ('Y', "Y", "Symmetric about Y=centroid (front/back mirror)"),
 ]
 
 
@@ -897,8 +1032,19 @@ class TRUSS_OT_FullPipeline(bpy.types.Operator):
     align_axis: EnumProperty(
         name="Align Axis",
         items=ALIGN_AXIS_ITEMS,
-        default='Z',
-        description="Axis on which to cluster and snap co-planar nodes"
+        default='AUTO',
+        description="How to align nodes — AUTO runs Z then X then Y in one pass"
+    )
+    enforce_symmetry: BoolProperty(
+        name="Enforce Symmetry",
+        default=False,
+        description="Snap near-symmetric vertex pairs to exact mirror positions (AUTO mode only)"
+    )
+    sym_axis: EnumProperty(
+        name="Symmetry Axis",
+        items=SYM_AXIS_ITEMS,
+        default='X',
+        description="The axis about which the structure is symmetric"
     )
     max_extension: FloatProperty(
         name="Max Extension (m)",
@@ -924,6 +1070,8 @@ class TRUSS_OT_FullPipeline(bpy.types.Operator):
     def invoke(self, context, _event):
         sc = context.scene
         self.align_axis = sc.pipeline_align_axis
+        self.enforce_symmetry = sc.pipeline_enforce_symmetry
+        self.sym_axis = sc.pipeline_sym_axis
         self.max_extension = sc.pipeline_max_extension
         self.weld_threshold = sc.pipeline_weld_threshold
         self.min_length = sc.pipeline_min_length
@@ -960,7 +1108,13 @@ class TRUSS_OT_FullPipeline(bpy.types.Operator):
         bpy.ops.object.mode_set(mode='EDIT')
         bpy.ops.mesh.select_all(action='SELECT')
 
-        if self.align_axis != 'SKIP':
+        if self.align_axis == 'AUTO':
+            bpy.ops.truss.smart_auto_align(
+                'EXEC_DEFAULT',
+                enforce_symmetry=self.enforce_symmetry,
+                sym_axis=self.sym_axis,
+            )
+        elif self.align_axis != 'SKIP':
             bpy.ops.truss.align_vertices('EXEC_DEFAULT', axis=self.align_axis)
 
         # Step 3: Connect loose ends
@@ -1008,11 +1162,16 @@ class TRUSS_PT_MainPanel(bpy.types.Panel):
         box.operator("truss.full_pipeline", text="Run Full Auto Pipeline", icon='SHADERFX')
 
         cfg = box.column(align=True)
-        cfg.prop(sc, "pipeline_align_axis", text="Align Axis")
+        cfg.prop(sc, "pipeline_align_axis", text="Align")
+        if sc.pipeline_align_axis == 'AUTO':
+            sym_row = cfg.row(align=True)
+            sym_row.prop(sc, "pipeline_enforce_symmetry", text="Enforce Symmetry")
+            if sc.pipeline_enforce_symmetry:
+                sym_row.prop(sc, "pipeline_sym_axis", text="")
         cfg.prop(sc, "pipeline_min_length", text="Min Length (m)")
         cfg.prop(sc, "pipeline_min_aspect_ratio", text="Min Aspect Ratio")
         cfg.prop(sc, "pipeline_max_extension", text="Max Extension (m)")
-        cfg.prop(sc, "pipeline_weld_threshold", text="Weld Threshold (m)")
+        cfg.prop(sc, "pipeline_weld_threshold", text="Weld (m)")
 
         layout.separator()
 
@@ -1035,6 +1194,19 @@ class TRUSS_PT_MainPanel(bpy.types.Panel):
         align_col.active = is_edit
         align_col.prop(sc, "align_tolerance", text="Tolerance (m)")
 
+        # Smart one-click alignment
+        smart_col = align_col.column(align=True)
+        op = smart_col.operator("truss.smart_auto_align", text="Smart Auto-Align (Z + X + Y)", icon='ORIENTATION_GLOBAL')
+        op.enforce_symmetry = sc.align_enforce_symmetry
+        op.sym_axis = sc.align_sym_axis
+        sym_row = smart_col.row(align=True)
+        sym_row.prop(sc, "align_enforce_symmetry", text="Enforce Symmetry")
+        if sc.align_enforce_symmetry:
+            sym_row.prop(sc, "align_sym_axis", text="")
+
+        align_col.separator()
+
+        # Manual per-axis buttons
         row = align_col.row(align=True)
         row.operator("truss.align_vertices", text="X").axis = 'X'
         row.operator("truss.align_vertices", text="Y").axis = 'Y'
@@ -1155,6 +1327,7 @@ classes = (
     TRUSS_OT_ConvertLines,
     TRUSS_OT_ConvertAssemblyLines,
     TRUSS_OT_AlignVertices,
+    TRUSS_OT_SmartAutoAlign,
     TRUSS_OT_ConnectLines,
     TRUSS_OT_RebuildIntersections,
     TRUSS_OT_SanityCheck,
@@ -1178,8 +1351,24 @@ def register():
         description="Distance within which vertices are grouped for alignment"
     )
     bpy.types.Scene.pipeline_align_axis = EnumProperty(
-        name="Align Axis", items=ALIGN_AXIS_ITEMS, default='Z',
+        name="Align Axis", items=ALIGN_AXIS_ITEMS, default='AUTO',
         description="Axis used by the full pipeline to cluster co-planar nodes"
+    )
+    bpy.types.Scene.pipeline_enforce_symmetry = BoolProperty(
+        name="Enforce Symmetry", default=False,
+        description="Snap near-symmetric vertex pairs to exact mirror positions (AUTO mode only)"
+    )
+    bpy.types.Scene.pipeline_sym_axis = EnumProperty(
+        name="Symmetry Axis", items=SYM_AXIS_ITEMS, default='X',
+        description="The axis about which the structure is symmetric"
+    )
+    bpy.types.Scene.align_enforce_symmetry = BoolProperty(
+        name="Enforce Symmetry", default=False,
+        description="Snap near-symmetric pairs to exact mirror during Smart Auto-Align"
+    )
+    bpy.types.Scene.align_sym_axis = EnumProperty(
+        name="Symmetry Axis", items=SYM_AXIS_ITEMS, default='X',
+        description="The axis about which to enforce symmetry"
     )
     bpy.types.Scene.pipeline_min_length = FloatProperty(
         name="Min Length", default=0.05, min=0.001, max=5.0,
@@ -1206,6 +1395,10 @@ def unregister():
     del bpy.types.Scene.calc_force_override
     del bpy.types.Scene.align_tolerance
     del bpy.types.Scene.pipeline_align_axis
+    del bpy.types.Scene.pipeline_enforce_symmetry
+    del bpy.types.Scene.pipeline_sym_axis
+    del bpy.types.Scene.align_enforce_symmetry
+    del bpy.types.Scene.align_sym_axis
     del bpy.types.Scene.pipeline_min_length
     del bpy.types.Scene.pipeline_min_aspect_ratio
     del bpy.types.Scene.pipeline_max_extension
